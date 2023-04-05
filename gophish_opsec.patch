@@ -1,0 +1,274 @@
+From 2a98b1b4e692f74eaa8717092ea7933718a2ff1d Mon Sep 17 00:00:00 2001
+From: n0kovo <n0kovo@riseup.net>
+Date: Wed, 5 Apr 2023 16:45:56 +0200
+Subject: [PATCH] Remove identifiable strings
+
+---
+ config/config.go             |  2 +-
+ controllers/phish.go         | 49 +++++++++++++++++++++++++++++-------
+ models/campaign.go           |  2 +-
+ models/email_request.go      |  2 +-
+ models/email_request_test.go |  2 +-
+ models/maillog.go            |  2 +-
+ models/maillog_test.go       |  6 ++---
+ templates/404.html           |  6 +++++
+ webhook/webhook.go           |  2 +-
+ 9 files changed, 55 insertions(+), 18 deletions(-)
+ create mode 100644 templates/404.html
+
+diff --git a/config/config.go b/config/config.go
+index 62b7a85..d20307f 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -43,7 +43,7 @@ type Config struct {
+ var Version = ""
+ 
+ // ServerName is the server type that is returned in the transparency response.
+-const ServerName = "gophish"
++const ServerName = "IGNORE"
+ 
+ // LoadConfig loads the configuration from the specified filepath
+ func LoadConfig(filepath string) (*Config, error) {
+diff --git a/controllers/phish.go b/controllers/phish.go
+index 71b25a8..8b84e64 100644
+--- a/controllers/phish.go
++++ b/controllers/phish.go
+@@ -1,10 +1,12 @@
+ package controllers
+ 
+ import (
++	"bytes"
+ 	"compress/gzip"
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"html/template"
+ 	"net"
+ 	"net/http"
+ 	"strings"
+@@ -81,6 +83,35 @@ func WithContactAddress(addr string) PhishingServerOption {
+ 	}
+ }
+ 
++// Overwrite net.https Error with a custom one to set our own headers
++// Go's internal Error func returns text/plain so browser's won't render the html
++func customError(w http.ResponseWriter, error string, code int) {
++        w.Header().Set("Server", "Microsoft-IIS/10.0")
++        w.Header().Set("Content-Type", "text/html; charset=utf-8")
++        w.Header().Set("X-Content-Type-Options", "nosniff")
++        w.Header().Set("X-XSS-Protection", "1; mode=block")
++        w.Header().Set("X-Frame-Options", "SAMEORIGIN")
++        w.Header().Set("Content-Security-Policy", "default-src https:")
++        w.WriteHeader(code)
++        fmt.Fprintln(w, error)
++}
++// Overwrite go's internal not found to allow templating the not found page
++// The templating string is currently not passed in, therefore there is no templating yet
++// If I need it in the future, it's a 5 minute change...
++func customNotFound(w http.ResponseWriter, r *http.Request) {
++	tmpl404, err := template.ParseFiles("templates/404.html")
++	if err != nil {
++		log.Fatal(err)
++	}
++	var b bytes.Buffer
++	err = tmpl404.Execute(&b, "")
++	if err != nil {
++		http.NotFound(w, r)
++		return
++	}
++	customError(w, b.String(), http.StatusNotFound)
++}
++
+ // Start launches the phishing server, listening on the configured address.
+ func (ps *PhishingServer) Start() {
+ 	if ps.config.UseTLS {
+@@ -138,7 +169,7 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
+ 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
+ 			log.Error(err)
+ 		}
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 		return
+ 	}
+ 	// Check for a preview
+@@ -172,7 +203,7 @@ func (ps *PhishingServer) ReportHandler(w http.ResponseWriter, r *http.Request)
+ 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
+ 			log.Error(err)
+ 		}
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 		return
+ 	}
+ 	// Check for a preview
+@@ -206,7 +237,7 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
+ 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
+ 			log.Error(err)
+ 		}
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 		return
+ 	}
+ 	w.Header().Set("X-Server", config.ServerName) // Useful for checking if this is a GoPhish server (e.g. for campaign reporting plugins)
+@@ -216,13 +247,13 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
+ 		ptx, err = models.NewPhishingTemplateContext(&preview, preview.BaseRecipient, preview.RId)
+ 		if err != nil {
+ 			log.Error(err)
+-			http.NotFound(w, r)
++			customNotFound(w, r)
+ 			return
+ 		}
+ 		p, err := models.GetPage(preview.PageId, preview.UserId)
+ 		if err != nil {
+ 			log.Error(err)
+-			http.NotFound(w, r)
++			customNotFound(w, r)
+ 			return
+ 		}
+ 		renderPhishResponse(w, r, ptx, p)
+@@ -242,7 +273,7 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
+ 	p, err := models.GetPage(c.PageId, c.UserId)
+ 	if err != nil {
+ 		log.Error(err)
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 		return
+ 	}
+ 	switch {
+@@ -260,7 +291,7 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
+ 	ptx, err = models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
+ 	if err != nil {
+ 		log.Error(err)
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 	}
+ 	renderPhishResponse(w, r, ptx, p)
+ }
+@@ -276,7 +307,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
+ 			redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
+ 			if err != nil {
+ 				log.Error(err)
+-				http.NotFound(w, r)
++				customNotFound(w, r)
+ 				return
+ 			}
+ 			http.Redirect(w, r, redirectURL, http.StatusFound)
+@@ -287,7 +318,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
+ 	html, err := models.ExecuteTemplate(p.HTML, ptx)
+ 	if err != nil {
+ 		log.Error(err)
+-		http.NotFound(w, r)
++		customNotFound(w, r)
+ 		return
+ 	}
+ 	w.Write([]byte(html))
+diff --git a/models/campaign.go b/models/campaign.go
+index debca6a..64093a2 100644
+--- a/models/campaign.go
++++ b/models/campaign.go
+@@ -127,7 +127,7 @@ var ErrSMTPNotFound = errors.New("Sending profile not found")
+ var ErrInvalidSendByDate = errors.New("The launch date must be before the \"send emails by\" date")
+ 
+ // RecipientParameter is the URL parameter that points to the result ID for a recipient.
+-const RecipientParameter = "rid"
++const RecipientParameter = "keyname"
+ 
+ // Validate checks to make sure there are no invalid fields in a submitted campaign
+ func (c *Campaign) Validate() error {
+diff --git a/models/email_request.go b/models/email_request.go
+index f441b61..b611979 100644
+--- a/models/email_request.go
++++ b/models/email_request.go
+@@ -120,7 +120,7 @@ func (s *EmailRequest) Generate(msg *gomail.Message) error {
+ 	// Add the transparency headers
+ 	msg.SetHeader("X-Mailer", config.ServerName)
+ 	if conf.ContactAddress != "" {
+-		msg.SetHeader("X-Gophish-Contact", conf.ContactAddress)
++		msg.SetHeader("X-Contact", conf.ContactAddress)
+ 	}
+ 
+ 	// Parse the customHeader templates
+diff --git a/models/email_request_test.go b/models/email_request_test.go
+index c21a503..57fac9a 100644
+--- a/models/email_request_test.go
++++ b/models/email_request_test.go
+@@ -79,7 +79,7 @@ func (s *ModelsSuite) TestEmailRequestGenerate(ch *check.C) {
+ 	s.config.ContactAddress = "test@test.com"
+ 	expectedHeaders := map[string]string{
+ 		"X-Mailer":          config.ServerName,
+-		"X-Gophish-Contact": s.config.ContactAddress,
++		"X-Contact": s.config.ContactAddress,
+ 	}
+ 
+ 	msg := gomail.NewMessage()
+diff --git a/models/maillog.go b/models/maillog.go
+index 7ab3a2e..92188b5 100644
+--- a/models/maillog.go
++++ b/models/maillog.go
+@@ -199,7 +199,7 @@ func (m *MailLog) Generate(msg *gomail.Message) error {
+ 	// Add the transparency headers
+ 	msg.SetHeader("X-Mailer", config.ServerName)
+ 	if conf.ContactAddress != "" {
+-		msg.SetHeader("X-Gophish-Contact", conf.ContactAddress)
++		msg.SetHeader("X-Contact", conf.ContactAddress)
+ 	}
+ 
+ 	// Add Message-Id header as described in RFC 2822.
+diff --git a/models/maillog_test.go b/models/maillog_test.go
+index 5489541..59bba16 100644
+--- a/models/maillog_test.go
++++ b/models/maillog_test.go
+@@ -267,7 +267,7 @@ func (s *ModelsSuite) TestMailLogGenerateTransparencyHeaders(ch *check.C) {
+ 	s.config.ContactAddress = "test@test.com"
+ 	expectedHeaders := map[string]string{
+ 		"X-Mailer":          config.ServerName,
+-		"X-Gophish-Contact": s.config.ContactAddress,
++		"X-Contact": s.config.ContactAddress,
+ 	}
+ 	campaign := s.createCampaign(ch)
+ 	got := s.emailFromFirstMailLog(campaign, ch)
+@@ -279,7 +279,7 @@ func (s *ModelsSuite) TestMailLogGenerateTransparencyHeaders(ch *check.C) {
+ func (s *ModelsSuite) TestMailLogGenerateOverrideTransparencyHeaders(ch *check.C) {
+ 	expectedHeaders := map[string]string{
+ 		"X-Mailer":          "",
+-		"X-Gophish-Contact": "",
++		"X-Contact": "",
+ 	}
+ 	smtp := SMTP{
+ 		Name:        "Test SMTP",
+@@ -287,7 +287,7 @@ func (s *ModelsSuite) TestMailLogGenerateOverrideTransparencyHeaders(ch *check.C
+ 		FromAddress: "foo@example.com",
+ 		UserId:      1,
+ 		Headers: []Header{
+-			Header{Key: "X-Gophish-Contact", Value: ""},
++			Header{Key: "X-Contact", Value: ""},
+ 			Header{Key: "X-Mailer", Value: ""},
+ 		},
+ 	}
+diff --git a/templates/404.html b/templates/404.html
+new file mode 100644
+index 0000000..205d05e
+--- /dev/null
++++ b/templates/404.html
+@@ -0,0 +1,6 @@
++<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN""http://www.w3.org/TR/html4/strict.dtd">
++<HTML><HEAD><TITLE>Not Found</TITLE>
++<META HTTP-EQUIV="Content-Type" Content="text/html; charset=us-ascii"></HEAD>
++<BODY><h2>Not Found</h2>
++<hr><p>HTTP Error 404. The requested resource is not found.</p>
++</BODY></HTML>
+diff --git a/webhook/webhook.go b/webhook/webhook.go
+index 92ee20b..d6f7343 100644
+--- a/webhook/webhook.go
++++ b/webhook/webhook.go
+@@ -26,7 +26,7 @@ const (
+ 
+ 	// SignatureHeader is the name of the HTTP header which contains the
+ 	// webhook signature
+-	SignatureHeader = "X-Gophish-Signature"
++	SignatureHeader = "X-Signature"
+ 
+ 	// Sha256Prefix is the prefix that specifies the hashing algorithm used
+ 	// for the signature
+-- 
+2.39.0
+
